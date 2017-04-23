@@ -1186,6 +1186,12 @@ static void mov_metadata_creation_time(AVDictionary **metadata, int64_t time)
     if (time) {
         if(time >= 2082844800)
             time -= 2082844800;  /* seconds between 1904-01-01 and Epoch */
+
+        if ((int64_t)(time * 1000000ULL) / 1000000 != time) {
+            av_log(NULL, AV_LOG_DEBUG, "creation_time is not representable\n");
+            return;
+        }
+
         avpriv_dict_set_timestamp(metadata, "creation_time", time * 1000000);
     }
 }
@@ -2315,7 +2321,7 @@ int ff_mov_read_stsd_entries(MOVContext *c, AVIOContext *pb, int entries)
         } else if (a.size > 0)
             avio_skip(pb, a.size);
 
-        if (sc->extradata) {
+        if (sc->extradata && st->codecpar->extradata) {
             int extra_size = st->codecpar->extradata_size;
 
             /* Move the current stream extradata to the stream context one. */
@@ -3309,7 +3315,7 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
     uint64_t stream_size = 0;
 
     if (sc->elst_count) {
-        int i, edit_start_index = 0;
+        int i, edit_start_index = 0, multiple_edits = 0;
         int64_t empty_duration = 0; // empty duration of the first edit list entry
         int64_t start_time = 0; // start time of the media
 
@@ -3322,15 +3328,28 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
                 edit_start_index = 1;
             } else if (i == edit_start_index && e->time >= 0) {
                 start_time = e->time;
+            } else {
+                multiple_edits = 1;
             }
         }
+
+        if (multiple_edits && !mov->advanced_editlist)
+            av_log(mov->fc, AV_LOG_WARNING, "multiple edit list entries, "
+                   "Use -advanced_editlist to correctly decode otherwise "
+                   "a/v desync might occur\n");
 
         /* adjust first dts according to edit list */
         if ((empty_duration || start_time) && mov->time_scale > 0) {
             if (empty_duration)
                 empty_duration = av_rescale(empty_duration, sc->time_scale, mov->time_scale);
             sc->time_offset = start_time - empty_duration;
+            if (!mov->advanced_editlist)
+                current_dts = -sc->time_offset;
         }
+
+        if (!multiple_edits && !mov->advanced_editlist &&
+            st->codecpar->codec_id == AV_CODEC_ID_AAC && start_time > 0)
+            sc->start_pad = start_time;
     }
 
     /* only use old uncompressed audio chunk demuxing when stts specifies it */
@@ -3564,8 +3583,10 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
         }
     }
 
-    // Fix index according to edit lists.
-    mov_fix_index(mov, st);
+    if (!mov->ignore_editlist && mov->advanced_editlist) {
+        // Fix index according to edit lists.
+        mov_fix_index(mov, st);
+    }
 }
 
 static int test_same_origin(const char *src, const char *ref) {
@@ -4338,8 +4359,8 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     uint8_t version;
     unsigned i, track_id;
     AVStream *st = NULL;
-    AVStream *ref_st;
-    MOVStreamContext *sc, *ref_sc;
+    AVStream *ref_st = NULL;
+    MOVStreamContext *sc, *ref_sc = NULL;
     MOVFragmentIndex *index = NULL;
     MOVFragmentIndex **tmp;
     AVRational timescale;
@@ -5243,6 +5264,54 @@ static int cenc_filter(MOVContext *c, MOVStreamContext *sc, int64_t index, uint8
     return 0;
 }
 
+static int mov_read_dops(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    const int OPUS_SEEK_PREROLL_MS = 80;
+    AVStream *st;
+    size_t size;
+    int16_t pre_skip;
+
+    if (c->fc->nb_streams < 1)
+        return 0;
+    st = c->fc->streams[c->fc->nb_streams-1];
+
+    if ((uint64_t)atom.size > (1<<30) || atom.size < 11)
+        return AVERROR_INVALIDDATA;
+
+    /* Check OpusSpecificBox version. */
+    if (avio_r8(pb) != 0) {
+        av_log(c->fc, AV_LOG_ERROR, "unsupported OpusSpecificBox version\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    /* OpusSpecificBox size plus magic for Ogg OpusHead header. */
+    size = atom.size + 8;
+
+    if (ff_alloc_extradata(st->codecpar, size))
+        return AVERROR(ENOMEM);
+
+    AV_WL32(st->codecpar->extradata, MKTAG('O','p','u','s'));
+    AV_WL32(st->codecpar->extradata + 4, MKTAG('H','e','a','d'));
+    AV_WB8(st->codecpar->extradata + 8, 1); /* OpusHead version */
+    avio_read(pb, st->codecpar->extradata + 9, size - 9);
+
+    /* OpusSpecificBox is stored in big-endian, but OpusHead is
+       little-endian; aside from the preceeding magic and version they're
+       otherwise currently identical.  Data after output gain at offset 16
+       doesn't need to be bytewapped. */
+    pre_skip = AV_RB16(st->codecpar->extradata + 10);
+    AV_WL16(st->codecpar->extradata + 10, pre_skip);
+    AV_WL32(st->codecpar->extradata + 12, AV_RB32(st->codecpar->extradata + 12));
+    AV_WL16(st->codecpar->extradata + 16, AV_RB16(st->codecpar->extradata + 16));
+
+    st->codecpar->initial_padding = pre_skip;
+    st->codecpar->seek_preroll = av_rescale_q(OPUS_SEEK_PREROLL_MS,
+                                              (AVRational){1, 1000},
+                                              (AVRational){1, 48000});
+
+    return 0;
+}
+
 static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('A','C','L','R'), mov_read_aclr },
 { MKTAG('A','P','R','G'), mov_read_avid },
@@ -5324,6 +5393,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('d','f','L','a'), mov_read_dfla },
 { MKTAG('s','t','3','d'), mov_read_st3d }, /* stereoscopic 3D video box */
 { MKTAG('s','v','3','d'), mov_read_sv3d }, /* spherical video box */
+{ MKTAG('d','O','p','s'), mov_read_dops },
 { 0, NULL }
 };
 
@@ -5773,6 +5843,7 @@ static int mov_read_close(AVFormatContext *s)
     av_freep(&mov->fragment_index_data);
 
     av_freep(&mov->aes_decrypt);
+    av_freep(&mov->chapter_tracks);
 
     return 0;
 }
@@ -6478,7 +6549,11 @@ static const AVOption mov_options[] = {
         "Seek each stream individually to the to the closest point",
         OFFSET(seek_individually), AV_OPT_TYPE_BOOL, { .i64 = 1 },
         0, 1, FLAGS},
-    {"ignore_editlist", "", OFFSET(ignore_editlist), AV_OPT_TYPE_BOOL, {.i64 = 0},
+    {"ignore_editlist", "Ignore the edit list atom.", OFFSET(ignore_editlist), AV_OPT_TYPE_BOOL, {.i64 = 0},
+        0, 1, FLAGS},
+    {"advanced_editlist",
+        "Modify the AVIndex according to the editlists. Use this option to decode in the order specified by the edits.",
+        OFFSET(advanced_editlist), AV_OPT_TYPE_BOOL, {.i64 = 1},
         0, 1, FLAGS},
     {"ignore_chapters", "", OFFSET(ignore_chapters), AV_OPT_TYPE_BOOL, {.i64 = 0},
         0, 1, FLAGS},

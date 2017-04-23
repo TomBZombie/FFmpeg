@@ -883,8 +883,11 @@ static int do_packet_auto_bsf(AVFormatContext *s, AVPacket *pkt) {
 
 #if FF_API_LAVF_MERGE_SD
 FF_DISABLE_DEPRECATION_WARNINGS
-    if (st->internal->nb_bsfcs)
-        av_packet_split_side_data(pkt);
+    if (st->internal->nb_bsfcs) {
+        ret = av_packet_split_side_data(pkt);
+        if (ret < 0)
+            av_log(s, AV_LOG_WARNING, "Failed to split side data before bitstream filter\n");
+    }
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
 
@@ -1419,7 +1422,7 @@ static int av_write_uncoded_frame_internal(AVFormatContext *s, int stream_index,
         pkt.size         = UNCODED_FRAME_PACKET_SIZE;
         pkt.pts          =
         pkt.dts          = frame->pts;
-        pkt.duration     = av_frame_get_pkt_duration(frame);
+        pkt.duration     = frame->pkt_duration;
         pkt.stream_index = stream_index;
         pkt.flags |= AV_PKT_FLAG_UNCODED_FRAME;
     }

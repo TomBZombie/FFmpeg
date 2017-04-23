@@ -1872,22 +1872,18 @@ static void print_pkt_side_data(WriterContext *w,
             print_int("inverted", !!(stereo->flags & AV_STEREO3D_FLAG_INVERT));
         } else if (sd->type == AV_PKT_DATA_SPHERICAL) {
             const AVSphericalMapping *spherical = (AVSphericalMapping *)sd->data;
-            if (spherical->projection == AV_SPHERICAL_EQUIRECTANGULAR)
-                print_str("projection", "equirectangular");
-            else if (spherical->projection == AV_SPHERICAL_CUBEMAP) {
-                print_str("projection", "cubemap");
+            print_str("projection", av_spherical_projection_name(spherical->projection));
+            if (spherical->projection == AV_SPHERICAL_CUBEMAP) {
                 print_int("padding", spherical->padding);
             } else if (spherical->projection == AV_SPHERICAL_EQUIRECTANGULAR_TILE) {
                 size_t l, t, r, b;
                 av_spherical_tile_bounds(spherical, par->width, par->height,
                                          &l, &t, &r, &b);
-                print_str("projection", "tiled equirectangular");
                 print_int("bound_left", l);
                 print_int("bound_top", t);
                 print_int("bound_right", r);
                 print_int("bound_bottom", b);
-            } else
-                print_str("projection", "unknown");
+            }
 
             print_int("yaw", (double) spherical->yaw / (1 << 16));
             print_int("pitch", (double) spherical->pitch / (1 << 16));
@@ -2053,13 +2049,13 @@ static void show_frame(WriterContext *w, AVFrame *frame, AVStream *stream,
     print_time("pkt_pts_time",          frame->pts, &stream->time_base);
     print_ts  ("pkt_dts",               frame->pkt_dts);
     print_time("pkt_dts_time",          frame->pkt_dts, &stream->time_base);
-    print_ts  ("best_effort_timestamp", av_frame_get_best_effort_timestamp(frame));
-    print_time("best_effort_timestamp_time", av_frame_get_best_effort_timestamp(frame), &stream->time_base);
-    print_duration_ts  ("pkt_duration",      av_frame_get_pkt_duration(frame));
-    print_duration_time("pkt_duration_time", av_frame_get_pkt_duration(frame), &stream->time_base);
-    if (av_frame_get_pkt_pos (frame) != -1) print_fmt    ("pkt_pos", "%"PRId64, av_frame_get_pkt_pos(frame));
+    print_ts  ("best_effort_timestamp", frame->best_effort_timestamp);
+    print_time("best_effort_timestamp_time", frame->best_effort_timestamp, &stream->time_base);
+    print_duration_ts  ("pkt_duration",      frame->pkt_duration);
+    print_duration_time("pkt_duration_time", frame->pkt_duration, &stream->time_base);
+    if (frame->pkt_pos != -1) print_fmt    ("pkt_pos", "%"PRId64, frame->pkt_pos);
     else                      print_str_opt("pkt_pos", "N/A");
-    if (av_frame_get_pkt_size(frame) != -1) print_val    ("pkt_size", av_frame_get_pkt_size(frame), unit_byte_str);
+    if (frame->pkt_size != -1) print_val    ("pkt_size", frame->pkt_size, unit_byte_str);
     else                       print_str_opt("pkt_size", "N/A");
 
     switch (stream->codecpar->codec_type) {
@@ -2090,18 +2086,18 @@ static void show_frame(WriterContext *w, AVFrame *frame, AVStream *stream,
         if (s) print_str    ("sample_fmt", s);
         else   print_str_opt("sample_fmt", "unknown");
         print_int("nb_samples",         frame->nb_samples);
-        print_int("channels", av_frame_get_channels(frame));
-        if (av_frame_get_channel_layout(frame)) {
+        print_int("channels", frame->channels);
+        if (frame->channel_layout) {
             av_bprint_clear(&pbuf);
-            av_bprint_channel_layout(&pbuf, av_frame_get_channels(frame),
-                                     av_frame_get_channel_layout(frame));
+            av_bprint_channel_layout(&pbuf, frame->channels,
+                                     frame->channel_layout);
             print_str    ("channel_layout", pbuf.str);
         } else
             print_str_opt("channel_layout", "unknown");
         break;
     }
     if (do_show_frame_tags)
-        show_tags(w, av_frame_get_metadata(frame), SECTION_ID_FRAME_TAGS);
+        show_tags(w, frame->metadata, SECTION_ID_FRAME_TAGS);
     if (do_show_log)
         show_log(w, SECTION_ID_FRAME_LOGS, SECTION_ID_FRAME_LOG, do_show_log);
     if (frame->nb_side_data) {
@@ -2134,7 +2130,8 @@ static void show_frame(WriterContext *w, AVFrame *frame, AVStream *stream,
 
 static av_always_inline int process_frame(WriterContext *w,
                                           InputFile *ifile,
-                                          AVFrame *frame, AVPacket *pkt)
+                                          AVFrame *frame, AVPacket *pkt,
+                                          int *packet_new)
 {
     AVFormatContext *fmt_ctx = ifile->fmt_ctx;
     AVCodecContext *dec_ctx = ifile->streams[pkt->stream_index].dec_ctx;
@@ -2146,24 +2143,39 @@ static av_always_inline int process_frame(WriterContext *w,
     if (dec_ctx && dec_ctx->codec) {
         switch (par->codec_type) {
         case AVMEDIA_TYPE_VIDEO:
-            ret = avcodec_decode_video2(dec_ctx, frame, &got_frame, pkt);
-            break;
-
         case AVMEDIA_TYPE_AUDIO:
-            ret = avcodec_decode_audio4(dec_ctx, frame, &got_frame, pkt);
+            if (*packet_new) {
+                ret = avcodec_send_packet(dec_ctx, pkt);
+                if (ret == AVERROR(EAGAIN)) {
+                    ret = 0;
+                } else if (ret >= 0 || ret == AVERROR_EOF) {
+                    ret = 0;
+                    *packet_new = 0;
+                }
+            }
+            if (ret >= 0) {
+                ret = avcodec_receive_frame(dec_ctx, frame);
+                if (ret >= 0) {
+                    got_frame = 1;
+                } else if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    ret = 0;
+                }
+            }
             break;
 
         case AVMEDIA_TYPE_SUBTITLE:
             ret = avcodec_decode_subtitle2(dec_ctx, &sub, &got_frame, pkt);
+            *packet_new = 0;
             break;
+        default:
+            *packet_new = 0;
         }
+    } else {
+        *packet_new = 0;
     }
 
     if (ret < 0)
         return ret;
-    ret = FFMIN(ret, pkt->size); /* guard against bogus return values */
-    pkt->data += ret;
-    pkt->size -= ret;
     if (got_frame) {
         int is_sub = (par->codec_type == AVMEDIA_TYPE_SUBTITLE);
         nb_streams_frames[pkt->stream_index]++;
@@ -2175,7 +2187,7 @@ static av_always_inline int process_frame(WriterContext *w,
         if (is_sub)
             avsubtitle_free(&sub);
     }
-    return got_frame;
+    return got_frame || *packet_new;
 }
 
 static void log_read_interval(const ReadInterval *interval, void *log_ctx, int log_level)
@@ -2206,7 +2218,7 @@ static int read_interval_packets(WriterContext *w, InputFile *ifile,
                                  const ReadInterval *interval, int64_t *cur_ts)
 {
     AVFormatContext *fmt_ctx = ifile->fmt_ctx;
-    AVPacket pkt, pkt1;
+    AVPacket pkt;
     AVFrame *frame = NULL;
     int ret = 0, i = 0, frame_count = 0;
     int64_t start = -INT64_MAX, end = interval->end;
@@ -2283,8 +2295,8 @@ static int read_interval_packets(WriterContext *w, InputFile *ifile,
                 nb_streams_packets[pkt.stream_index]++;
             }
             if (do_read_frames) {
-                pkt1 = pkt;
-                while (pkt1.size && process_frame(w, ifile, frame, &pkt1) > 0);
+                int packet_new = 1;
+                while (process_frame(w, ifile, frame, &pkt, &packet_new) > 0);
             }
         }
         av_packet_unref(&pkt);
@@ -2296,7 +2308,7 @@ static int read_interval_packets(WriterContext *w, InputFile *ifile,
     for (i = 0; i < fmt_ctx->nb_streams; i++) {
         pkt.stream_index = i;
         if (do_read_frames)
-            while (process_frame(w, ifile, frame, &pkt) > 0);
+            while (process_frame(w, ifile, frame, &pkt, &(int){1}) > 0);
     }
 
 end:
@@ -3446,8 +3458,6 @@ int main(int argc, char **argv)
         goto end;
     }
 #endif
-    av_log_set_callback(log_callback);
-
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
     register_exit(ffprobe_cleanup);
 
@@ -3462,6 +3472,9 @@ int main(int argc, char **argv)
 
     show_banner(argc, argv, options);
     parse_options(NULL, argc, argv, options, opt_input_file);
+
+    if (do_show_log)
+        av_log_set_callback(log_callback);
 
     /* mark things to show, based on -show_entries */
     SET_DO_SHOW(CHAPTERS, chapters);

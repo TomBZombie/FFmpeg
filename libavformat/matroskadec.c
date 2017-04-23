@@ -362,8 +362,11 @@ typedef struct MatroskaDemuxContext {
     /* File has SSA subtitles which prevent incremental cluster parsing. */
     int contains_ssa;
 
-    /* WebM DASH Manifest live flag/ */
+    /* WebM DASH Manifest live flag */
     int is_live;
+
+    /* Bandwidth value for WebM DASH Manifest */
+    int bandwidth;
 } MatroskaDemuxContext;
 
 typedef struct MatroskaBlock {
@@ -2548,10 +2551,9 @@ static int matroska_read_header(AVFormatContext *s)
         ebml.max_size        > sizeof(uint64_t)  ||
         ebml.id_length       > sizeof(uint32_t)  ||
         ebml.doctype_version > 3) {
-        av_log(matroska->ctx, AV_LOG_ERROR,
-               "EBML header using unsupported features\n"
-               "(EBML version %"PRIu64", doctype %s, doc version %"PRIu64")\n",
-               ebml.version, ebml.doctype, ebml.doctype_version);
+        avpriv_report_missing_feature(matroska->ctx,
+                                      "EBML version %"PRIu64", doctype %s, doc version %"PRIu64,
+                                      ebml.version, ebml.doctype, ebml.doctype_version);
         ebml_free(ebml_syntax, &ebml);
         return AVERROR_PATCHWELCOME;
     } else if (ebml.doctype_version == 3) {
@@ -3573,7 +3575,7 @@ typedef struct {
     int64_t end_offset;
 } CueDesc;
 
-/* This function searches all the Cues and returns the CueDesc corresponding the
+/* This function searches all the Cues and returns the CueDesc corresponding to
  * the timestamp ts. Returned CueDesc will be such that start_time_ns <= ts <
  * end_time_ns. All 4 fields will be set to -1 if ts >= file's duration.
  */
@@ -3913,7 +3915,20 @@ static int webm_dash_manifest_read_header(AVFormatContext *s)
     av_dict_set_int(&s->streams[0]->metadata, TRACK_NUMBER, tracks[0].num, 0);
 
     // parse the cues and populate Cue related fields
-    return matroska->is_live ? 0 : webm_dash_manifest_cues(s);
+    if (!matroska->is_live) {
+        ret = webm_dash_manifest_cues(s);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Error parsing Cues\n");
+            return ret;
+        }
+    }
+
+    // use the bandwidth from the command line if it was provided
+    if (matroska->bandwidth > 0) {
+        av_dict_set_int(&s->streams[0]->metadata, BANDWIDTH,
+                        matroska->bandwidth, 0);
+    }
+    return 0;
 }
 
 static int webm_dash_manifest_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -3924,6 +3939,7 @@ static int webm_dash_manifest_read_packet(AVFormatContext *s, AVPacket *pkt)
 #define OFFSET(x) offsetof(MatroskaDemuxContext, x)
 static const AVOption options[] = {
     { "live", "flag indicating that the input is a live file that only has the headers.", OFFSET(is_live), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
+    { "bandwidth", "bandwidth of this stream to be specified in the DASH manifest.", OFFSET(bandwidth), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 
